@@ -1,1 +1,1 @@
-# python-financial-models
+# Quantitative Finance Models (Python & Excel)
