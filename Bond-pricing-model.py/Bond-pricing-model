@@ -1,0 +1,77 @@
+# Bond pricing model
+
+import numpy as np
+
+# Bond Price
+
+def bond_price(face, coupon_rate, yield_rate, maturity, freq=1):
+    
+    coupon = face * coupon_rate / freq
+    periods = maturity * freq
+    y = yield_rate / freq
+    
+    price = 0
+    
+    for t in range(1, periods + 1):
+        price += coupon / (1 + y)**t
+        
+    price += face / (1 + y)**periods
+    
+    return price
+
+
+
+# Modified Duration (Numerical)
+
+def modified_duration(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
+    
+    price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
+    
+    price_up = bond_price(face, coupon_rate, yield_rate + bump, maturity, freq)
+    price_down = bond_price(face, coupon_rate, yield_rate - bump, maturity, freq)
+    
+    mod_duration = (price_down - price_up) / (2 * price * bump)
+    
+    return mod_duration
+
+
+
+# DV01
+
+def dv01(face, coupon_rate, yield_rate, maturity, freq=1):
+    
+    mod_dur = modified_duration(face, coupon_rate, yield_rate, maturity, freq)
+    price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
+    
+    return mod_dur * price * 0.0001
+
+
+
+# Convexity (Numerical)
+
+def convexity(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
+    
+    price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
+    
+    price_up = bond_price(face, coupon_rate, yield_rate + bump, maturity, freq)
+    price_down = bond_price(face, coupon_rate, yield_rate - bump, maturity, freq)
+    
+    convex = (price_up + price_down - 2 * price) / (price * bump**2)
+    
+    return convex
+
+
+face = 1000
+coupon = 0.08
+yield_rate = 0.07
+maturity = 5
+
+print("Price:", bond_price(face, coupon, yield_rate, maturity))
+print("Modified Duration:", modified_duration(face, coupon, yield_rate, maturity))
+print("Convexity:", convexity(face, coupon, yield_rate, maturity))
+print("DV01:", dv01(face, coupon, yield_rate, maturity))
+
+
+
+
+

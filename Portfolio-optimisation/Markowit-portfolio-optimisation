@@ -1,0 +1,61 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# Stocks
+stocks = ['RELIANCE.NS','TCS.NS','INFY.NS','HDFCBANK.NS']
+
+data = yf.download(stocks, start="2020-01-01")['Close']
+
+# Daily returns
+returns = data.pct_change().dropna()
+
+mean_returns = returns.mean()
+cov_matrix = returns.cov()
+
+num_portfolios = 10000
+
+results = []
+weights_record = []
+
+for i in range(num_portfolios):
+
+    weights = np.random.random(len(stocks))
+    weights = weights / np.sum(weights)
+
+    weights_record.append(weights)
+
+    portfolio_return = np.sum(mean_returns * weights) * 252
+
+    portfolio_volatility = np.sqrt(
+        np.dot(weights.T, np.dot(cov_matrix * 252, weights))
+    )
+
+    sharpe = portfolio_return / portfolio_volatility
+
+    results.append([portfolio_return, portfolio_volatility, sharpe])
+
+# Convert results
+results = np.array(results)
+
+df = pd.DataFrame(results, columns=['Return','Volatility','Sharpe'])
+
+# Find best portfolio
+max_sharpe_idx = df['Sharpe'].idxmax()
+
+best_weights = weights_record[max_sharpe_idx]
+
+print("Best Portfolio Weights")
+
+for stock, weight in zip(stocks, best_weights):
+    print(stock, round(weight,3))
+
+# ----- PLOT GRAPH -----
+
+plt.scatter(df['Volatility'], df['Return'], c=df['Sharpe'])
+plt.xlabel("Risk (Volatility)")
+plt.ylabel("Expected Return")
+plt.title("Portfolio Optimization")
+
+plt.show()
