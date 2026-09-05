@@ -1,1 +1,272 @@
+"""
+Project 1: Portfolio Optimization & Risk Simulation
+Markowitz optimization (exact + sampled) + out-of-sample backtest
++ Monte Carlo / Parametric / Historical VaR comparison.
 
+Run locally (needs internet access for yfinance).
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG
+# ============================================================
+STOCKS      = ['RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'PIIND.NS']
+START       = "2020-01-01"
+TRAIN_END   = "2023-12-31"
+TEST_START  = "2024-01-01"
+TEST_END    = "2025-04-01"
+RISK_FREE   = 0.065          # annualized, India repo-rate proxy
+INITIAL_INVESTMENT = 100000  # Rs 1,00,000
+NUM_RANDOM_PORTFOLIOS = 10000
+MC_SIMULATIONS = 10000
+MC_DAYS = 30                  # 30-day forward VaR horizon
+CONFIDENCE = 0.95
+SEED = 42
+
+np.random.seed(SEED)
+
+# ============================================================
+# 1. DATA
+# ============================================================
+def load_data(use_live=True, csv_path=None):
+    if use_live:
+        raw = yf.download(STOCKS, start=START, end=TEST_END)['Close']
+    else:
+        raw = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+    raw = raw.dropna(axis=1, thresh=int(0.95 * len(raw)))   # drop tickers missing >5% history
+    raw = raw.dropna()
+    return raw
+
+def run(raw):
+    stocks = list(raw.columns)
+    n_assets = len(stocks)
+    print(f"Using {n_assets} assets: {stocks}")
+    print(f"Data range: {raw.index.min().date()} to {raw.index.max().date()}  ({len(raw)} trading days)")
+
+    train_prices = raw[raw.index <= TRAIN_END]
+    test_prices  = raw[(raw.index >= TEST_START) & (raw.index <= TEST_END)]
+
+    train_returns = train_prices.pct_change().dropna()
+    test_returns  = test_prices.pct_change().dropna()
+
+    mean_returns = train_returns.mean()
+    cov_matrix   = train_returns.cov()
+    corr_matrix  = train_returns.corr()
+
+    print(f"Training period: {train_returns.index.min().date()} to {train_returns.index.max().date()}  ({len(train_returns)} days)")
+    print(f"Test period:     {test_returns.index.min().date()} to {test_returns.index.max().date()}  ({len(test_returns)} days)")
+
+    # ============================================================
+    # 2. PORTFOLIO OPTIMIZATION  -- exact solve + Monte Carlo sampling
+    # ============================================================
+    def portfolio_perf(w, mean_ret, cov, rf=RISK_FREE):
+        ret = np.sum(mean_ret * w) * 252
+        vol = np.sqrt(w.T @ cov @ w * 252)
+        sharpe = (ret - rf) / vol
+        return ret, vol, sharpe
+
+    def neg_sharpe(w, mean_ret, cov, rf=RISK_FREE):
+        return -portfolio_perf(w, mean_ret, cov, rf)[2]
+
+    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    init_guess = np.repeat(1/n_assets, n_assets)
+
+    opt_result = minimize(neg_sharpe, init_guess, args=(mean_returns, cov_matrix),
+                           method='SLSQP', bounds=bounds, constraints=constraints)
+    optimal_weights_exact = opt_result.x
+
+    results, weights_record = [], []
+    for _ in range(NUM_RANDOM_PORTFOLIOS):
+        w = np.random.random(n_assets)
+        w /= w.sum()
+        weights_record.append(w)
+        ret, vol, sharpe = portfolio_perf(w, mean_returns, cov_matrix)
+        results.append([ret, vol, sharpe])
+
+    results_df = pd.DataFrame(results, columns=['Return', 'Volatility', 'Sharpe'])
+    best_sampled_idx = results_df['Sharpe'].idxmax()
+    optimal_weights_sampled = weights_record[best_sampled_idx]
+
+    print("\n" + "="*60)
+    print("OPTIMIZATION RESULTS (trained on in-sample period)")
+    print("="*60)
+    ret_e, vol_e, sharpe_e = portfolio_perf(optimal_weights_exact, mean_returns, cov_matrix)
+    ret_s, vol_s, sharpe_s = portfolio_perf(optimal_weights_sampled, mean_returns, cov_matrix)
+    print(f"{'Method':<25}{'Return':>10}{'Vol':>10}{'Sharpe':>10}")
+    print(f"{'Exact (SLSQP)':<25}{ret_e*100:>9.2f}%{vol_e*100:>9.2f}%{sharpe_e:>10.2f}")
+    print(f"{'Sampled (10k random)':<25}{ret_s*100:>9.2f}%{vol_s*100:>9.2f}%{sharpe_s:>10.2f}")
+    print(f"Gap between exact and sampled Sharpe: {abs(sharpe_e - sharpe_s):.3f}  "
+          f"(quantifies how good the random search approximation is)")
+
+    for stock, we, ws in zip(stocks, optimal_weights_exact, optimal_weights_sampled):
+        print(f"  {stock:<15} exact={we:.3f}   sampled={ws:.3f}")
+
+    best_weights = optimal_weights_exact
+
+    # ============================================================
+    # 3. EQUAL-WEIGHT BENCHMARK (in-sample)
+    # ============================================================
+    equal_weights = np.repeat(1/n_assets, n_assets)
+    ret_eq, vol_eq, sharpe_eq = portfolio_perf(equal_weights, mean_returns, cov_matrix)
+
+    print("\n" + "="*60)
+    print("BENCHMARK COMPARISON (in-sample)")
+    print("="*60)
+    print(f"{'Optimized':<15}{ret_e*100:>9.2f}%{vol_e*100:>9.2f}%{sharpe_e:>10.2f}")
+    print(f"{'Equal-weight':<15}{ret_eq*100:>9.2f}%{vol_eq*100:>9.2f}%{sharpe_eq:>10.2f}")
+
+    # ============================================================
+    # 4. OUT-OF-SAMPLE BACKTEST
+    # ============================================================
+    def backtest(weights, returns_df, rf=RISK_FREE, label=""):
+        daily = returns_df.dot(weights)
+        cumulative = (1 + daily).cumprod()
+        total_ret = cumulative.iloc[-1] - 1
+        ann_ret = (1 + total_ret) ** (252/len(daily)) - 1
+        ann_vol = daily.std() * np.sqrt(252)
+        sharpe = (ann_ret - rf) / ann_vol
+        roll_max = cumulative.cummax()
+        dd = (cumulative - roll_max) / roll_max
+        max_dd = dd.min()
+        print(f"\n--- {label} ---")
+        print(f"  Total Return:      {total_ret*100:.2f}%")
+        print(f"  Annualized Return: {ann_ret*100:.2f}%")
+        print(f"  Annualized Vol:    {ann_vol*100:.2f}%")
+        print(f"  Sharpe Ratio:      {sharpe:.2f}")
+        print(f"  Max Drawdown:      {max_dd*100:.2f}%")
+        return cumulative, {'total_ret': total_ret, 'ann_ret': ann_ret, 'ann_vol': ann_vol,
+                             'sharpe': sharpe, 'max_dd': max_dd}
+
+    print("\n" + "="*60)
+    print(f"OUT-OF-SAMPLE BACKTEST ({TEST_START} to {TEST_END})")
+    print("="*60)
+    cum_opt, stats_opt = backtest(best_weights, test_returns, label="Optimized Portfolio")
+    cum_eq,  stats_eq  = backtest(equal_weights, test_returns, label="Equal-Weight Benchmark")
+
+    print(f"\nOut-of-sample Sharpe improvement: {stats_opt['sharpe'] - stats_eq['sharpe']:.2f}")
+    if stats_opt['sharpe'] < stats_eq['sharpe']:
+        print("NOTE: optimized portfolio underperformed equal-weight out-of-sample --")
+        print("      this is a real, reportable finding (in-sample optimization can overfit).")
+
+    # ============================================================
+    # 5. MONTE CARLO FORWARD RISK SIMULATION (correlated GBM) -- CORRECTED
+    # ============================================================
+    mu_annual    = mean_returns.values * 252
+    sigma_annual = train_returns.std().values * np.sqrt(252)
+    corr = corr_matrix.values
+
+    def monte_carlo_var(dollar_alloc, mu, sigma, corr, T_days, n_sims, confidence=0.95):
+        dt = 1/252
+        n_assets_ = len(mu)
+        chol = np.linalg.cholesky(corr)
+        # track RUPEE VALUE per asset per simulation, not raw prices
+        values = np.tile(dollar_alloc, (n_sims, 1)).astype(float)
+
+        for _ in range(T_days):
+            Z = np.random.standard_normal((n_sims, n_assets_))
+            correlated_Z = Z @ chol.T
+            growth = np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*correlated_Z)
+            values *= growth   # each asset's allocation grows by its own simulated return
+
+        portfolio_values = values.sum(axis=1)
+        initial_value = dollar_alloc.sum()
+        pnl = portfolio_values - initial_value
+        var_abs = -np.percentile(pnl, (1-confidence)*100)   # loss, not raw value -- fixes original bug
+        var_pct = var_abs / initial_value
+        return portfolio_values, var_abs, var_pct
+
+    dollar_alloc = best_weights * INITIAL_INVESTMENT   # weights -> rupee allocation -- fixes original bug
+    mc_values, mc_var_abs, mc_var_pct = monte_carlo_var(
+        dollar_alloc, mu_annual, sigma_annual, corr,
+        T_days=MC_DAYS, n_sims=MC_SIMULATIONS, confidence=CONFIDENCE
+    )
+
+    print("\n" + "="*60)
+    print(f"MONTE CARLO {MC_DAYS}-DAY VaR ({int(CONFIDENCE*100)}%) -- {MC_SIMULATIONS} correlated GBM paths")
+    print("="*60)
+    print(f"  Initial Investment:  Rs {INITIAL_INVESTMENT:,.0f}")
+    print(f"  Expected Value ({MC_DAYS}d): Rs {mc_values.mean():,.0f}")
+    print(f"  Monte Carlo VaR:     Rs {mc_var_abs:,.0f}  ({mc_var_pct*100:.2f}% of portfolio)")
+
+    # ============================================================
+    # 6. PARAMETRIC (VARIANCE-COVARIANCE) VaR -- for comparison
+    # ============================================================
+    port_daily_vol = np.sqrt(best_weights @ cov_matrix.values @ best_weights)
+    port_mean_daily = np.sum(mean_returns.values * best_weights)
+    z_score = 1.645  # 95% one-tailed
+    scale = np.sqrt(MC_DAYS)
+    param_var_pct = (z_score * port_daily_vol * scale) - (port_mean_daily * MC_DAYS)
+    param_var_abs = param_var_pct * INITIAL_INVESTMENT
+
+    print(f"\nParametric (Variance-Covariance) VaR:")
+    print(f"  VaR: Rs {param_var_abs:,.0f}  ({param_var_pct*100:.2f}% of portfolio)")
+
+    # ============================================================
+    # 7. HISTORICAL SIMULATION VaR -- for comparison
+    # ============================================================
+    port_hist_daily = train_returns.dot(best_weights)
+    n_hist = len(port_hist_daily)
+    hist_n_day_returns = []
+    for _ in range(5000):
+        idx = np.random.randint(0, n_hist - MC_DAYS)
+        block = port_hist_daily.iloc[idx: idx+MC_DAYS]
+        hist_n_day_returns.append((1+block).prod() - 1)
+    hist_n_day_returns = np.array(hist_n_day_returns)
+    hist_var_pct = -np.percentile(hist_n_day_returns, (1-CONFIDENCE)*100)
+    hist_var_abs = hist_var_pct * INITIAL_INVESTMENT
+
+    print(f"\nHistorical Simulation VaR (bootstrapped {MC_DAYS}-day blocks):")
+    print(f"  VaR: Rs {hist_var_abs:,.0f}  ({hist_var_pct*100:.2f}% of portfolio)")
+
+    # ============================================================
+    # 8. THREE-METHOD VaR COMPARISON TABLE
+    # ============================================================
+    print("\n" + "="*60)
+    print(f"VaR METHOD COMPARISON ({MC_DAYS}-day, {int(CONFIDENCE*100)}% confidence)")
+    print("="*60)
+    print(f"{'Method':<25}{'VaR %':>10}{'VaR (Rs)':>15}")
+    print(f"{'Monte Carlo (GBM)':<25}{mc_var_pct*100:>9.2f}%{mc_var_abs:>15,.0f}")
+    print(f"{'Parametric':<25}{param_var_pct*100:>9.2f}%{param_var_abs:>15,.0f}")
+    print(f"{'Historical Simulation':<25}{hist_var_pct*100:>9.2f}%{hist_var_abs:>15,.0f}")
+
+    # ============================================================
+    # 9. PLOTS
+    # ============================================================
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    sc = axes[0,0].scatter(results_df['Volatility'], results_df['Return'], c=results_df['Sharpe'],
+                            cmap='viridis', s=8, alpha=0.4)
+    axes[0,0].scatter(vol_e, ret_e, color='red', s=120, label='Exact Optimum', zorder=5)
+    axes[0,0].scatter(vol_eq, ret_eq, color='black', marker='x', s=120, label='Equal-Weight', zorder=5)
+    axes[0,0].set_xlabel("Volatility"); axes[0,0].set_ylabel("Return"); axes[0,0].legend()
+    axes[0,0].set_title("Efficient Frontier")
+
+    (cum_opt*INITIAL_INVESTMENT).plot(ax=axes[0,1], label='Optimized')
+    (cum_eq*INITIAL_INVESTMENT).plot(ax=axes[0,1], label='Equal-Weight')
+    axes[0,1].axhline(INITIAL_INVESTMENT, color='gray', linestyle='--')
+    axes[0,1].set_title("Out-of-Sample Backtest"); axes[0,1].legend()
+
+    axes[1,0].hist(mc_values, bins=60, alpha=0.7)
+    axes[1,0].axvline(INITIAL_INVESTMENT - mc_var_abs, color='red', linestyle='--',
+                       label=f'{int(CONFIDENCE*100)}% VaR')
+    axes[1,0].set_title(f"Monte Carlo {MC_DAYS}-Day Portfolio Value Distribution"); axes[1,0].legend()
+
+    methods = ['Monte Carlo', 'Parametric', 'Historical']
+    var_pcts = [mc_var_pct*100, param_var_pct*100, hist_var_pct*100]
+    axes[1,1].bar(methods, var_pcts, color=['steelblue','orange','green'])
+    axes[1,1].set_ylabel("VaR (%)"); axes[1,1].set_title("VaR Method Comparison")
+
+    plt.tight_layout()
+    plt.savefig('output.png', dpi=100)   # saves in the same folder you run the script from
+    print("\nChart saved to output.png")
+
+
+if __name__ == "__main__":
+    raw = load_data(use_live=True)
+    run(raw)
