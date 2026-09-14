@@ -1,36 +1,415 @@
-# BlacK-scholes-option-pricing-model
+"""
+Project 2: Volatility Modeling & Options Analytics
+
+Black-Scholes with dividend yield + Greeks + implied volatility solver,
+extended with:
+  1. GARCH(1,1) vs. naive historical volatility forecasting, evaluated
+     walk-forward and compared via a Diebold-Mariano test.
+  2. Implied volatility smile/skew extraction from a real market option
+     chain, with a regression test for whether the smile/skew is
+     statistically significant (i.e., whether Black-Scholes' constant-
+     volatility assumption is empirically violated).
+  3. A paired test comparing option-pricing accuracy (GARCH-vol vs.
+     historical-vol as the BS input) against real market prices.
+
+Run locally (needs internet access for yfinance to pull the underlying's
+price history; the option chain for the smile section needs to come from
+a source that actually publishes NSE option data -- see NOTE in section D).
+"""
 
 import numpy as np
+import pandas as pd
+import yfinance as yf
 from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy import stats
+from arch import arch_model
+import matplotlib.pyplot as plt
 
-def black_scholes(S, K, T, r, sigma, option_type="call"):
-    
-    
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+# ============================================================
+# CONFIG
+# ============================================================
+UNDERLYING       = "RELIANCE.NS"   # single underlying for this project
+START             = "2020-01-01"
+TRAIN_END         = "2023-12-31"
+TEST_START        = "2024-01-01"
+TEST_END          = "2025-04-01"
+RISK_FREE         = 0.065          # annualized, same convention as Project 1
+DIVIDEND_YIELD    = 0.0035         # set per-underlying; 0 if unknown/not applicable
 
+# Walk-forward volatility forecast evaluation
+VOL_WINDOW        = 500            # trailing days used to fit GARCH / rolling hist vol
+VOL_HORIZON       = 5              # forecast horizon in trading days (~1 week)
+VOL_STEP          = 5              # step between forecast origins (reduces runtime + overlap)
+HIST_VOL_WINDOW   = 20             # window for the naive historical-vol benchmark
+
+SEED = 42
+np.random.seed(SEED)
+
+# Stocks used for the multi-stock robustness check (same universe as
+# Project 1, for consistency across the portfolio)
+ROBUSTNESS_TICKERS = ['RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS']
+
+
+# ============================================================
+# A. DATA
+# ============================================================
+def load_price_history(ticker=UNDERLYING, start=START, end=TEST_END):
+    raw = yf.download(ticker, start=start, end=end)['Close']
+    raw = raw.dropna()
+    return raw
+
+
+# ============================================================
+# B. BLACK-SCHOLES CORE + GREEKS + IMPLIED VOLATILITY
+# ============================================================
+def black_scholes(S, K, T, r, sigma, q=0.0, option_type="call"):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        raise ValueError("S, K, T, sigma must all be positive")
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
     if option_type == "call":
-        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        price = S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
     elif option_type == "put":
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        price = K*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
     else:
         raise ValueError("option_type must be 'call' or 'put'")
-
     return price
 
 
-# Example
-S = 100      # Stock price
-K = 100      # Strike price
-T = 1        # 1 year
-r = 0.05     # 5% interest rate
-sigma = 0.2  # 20% volatility
+def bs_greeks(S, K, T, r, sigma, q=0.0, option_type="call"):
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    pdf_d1 = norm.pdf(d1)
+    if option_type == "call":
+        delta = np.exp(-q*T)*norm.cdf(d1)
+        theta = (-S*pdf_d1*sigma*np.exp(-q*T)/(2*np.sqrt(T))
+                 - r*K*np.exp(-r*T)*norm.cdf(d2)
+                 + q*S*np.exp(-q*T)*norm.cdf(d1))
+        rho = K*T*np.exp(-r*T)*norm.cdf(d2)
+    else:
+        delta = -np.exp(-q*T)*norm.cdf(-d1)
+        theta = (-S*pdf_d1*sigma*np.exp(-q*T)/(2*np.sqrt(T))
+                 + r*K*np.exp(-r*T)*norm.cdf(-d2)
+                 - q*S*np.exp(-q*T)*norm.cdf(-d1))
+        rho = -K*T*np.exp(-r*T)*norm.cdf(-d2)
+    gamma = np.exp(-q*T)*pdf_d1 / (S*sigma*np.sqrt(T))
+    vega = S*np.exp(-q*T)*pdf_d1*np.sqrt(T)
+    return {'delta': delta, 'gamma': gamma, 'vega': vega, 'theta': theta, 'rho': rho}
 
-print("Call Price:", black_scholes(S, K, T, r, sigma, "call"))
-print("Put Price:", black_scholes(S, K, T, r, sigma, "put"))
+
+def implied_volatility(market_price, S, K, T, r, q=0.0, option_type="call"):
+    """Back out IV from a market price via Brent's method (bounded, derivative-free)."""
+    if option_type == "call":
+        intrinsic = max(S*np.exp(-q*T) - K*np.exp(-r*T), 0)
+        upper = S*np.exp(-q*T)
+    else:
+        intrinsic = max(K*np.exp(-r*T) - S*np.exp(-q*T), 0)
+        upper = K*np.exp(-r*T)
+    if market_price < intrinsic - 1e-8 or market_price > upper + 1e-8:
+        return np.nan  # violates no-arbitrage bounds, can't invert
+
+    def obj(sigma):
+        return black_scholes(S, K, T, r, sigma, q, option_type) - market_price
+
+    try:
+        return brentq(obj, 1e-4, 5.0, xtol=1e-8)
+    except ValueError:
+        return np.nan
 
 
+# ============================================================
+# C. GARCH(1,1) vs. HISTORICAL VOLATILITY -- WALK-FORWARD + DIEBOLD-MARIANO
+# ============================================================
+def garch_vol_forecast(returns_pct_train, horizon_days=VOL_HORIZON):
+    """GARCH(1,1) forecast of annualized volatility over the next horizon_days."""
+    am = arch_model(returns_pct_train, vol='Garch', p=1, q=1, dist='normal')
+    res = am.fit(disp='off')
+    fcast = res.forecast(horizon=horizon_days, reindex=False)
+    var_path = fcast.variance.values[-1, :]
+    return np.sqrt(var_path.mean() * 252) / 100
 
 
+def historical_vol_forecast(returns_decimal_train, window=HIST_VOL_WINDOW):
+    """Naive benchmark: trailing rolling-window realized vol, annualized."""
+    return returns_decimal_train[-window:].std() * np.sqrt(252)
 
 
+def realized_vol(returns_decimal_future, horizon_days):
+    """The forecast TARGET: actual realized vol over the next horizon_days."""
+    return returns_decimal_future[:horizon_days].std() * np.sqrt(252)
+
+
+def diebold_mariano_test(errors_a, errors_b, h=1, loss='squared'):
+    """
+    H0: forecast A and forecast B have equal expected loss (equal accuracy).
+    H1: they differ (two-sided).
+    Newey-West HAC variance with (h-1) Bartlett-weighted lags accounts for
+    autocorrelation from overlapping forecast horizons.
+    """
+    e_a = np.asarray(errors_a); e_b = np.asarray(errors_b)
+    d = (e_a**2 - e_b**2) if loss == 'squared' else (np.abs(e_a) - np.abs(e_b))
+    n = len(d)
+    d_mean = d.mean()
+    var_d = np.var(d, ddof=0)
+    for lag in range(1, h):
+        cov = np.cov(d[lag:], d[:-lag])[0, 1]
+        var_d += 2 * (1 - lag/h) * cov
+    var_d = max(var_d, 1e-12)
+    dm_stat = d_mean / np.sqrt(var_d / n)
+    p_value = 2 * (1 - stats.norm.cdf(np.abs(dm_stat)))
+    return {'dm_stat': dm_stat, 'p_value': p_value, 'mean_loss_diff': d_mean}
+
+
+def walk_forward_vol_eval(returns_decimal, window=VOL_WINDOW, horizon=VOL_HORIZON,
+                            step=VOL_STEP, hist_window=HIST_VOL_WINDOW):
+    """
+    At each forecast origin: fit GARCH(1,1) and a naive rolling-vol
+    benchmark on the trailing `window` days, forecast the next `horizon`
+    days' realized vol both ways, then compare to what actually happened.
+    Returns per-method forecast error arrays for the Diebold-Mariano test.
+    """
+    n = len(returns_decimal)
+    garch_errors, hist_errors, origins = [], [], []
+    for origin in range(window, n - horizon, step):
+        train = returns_decimal[origin-window:origin]
+        future = returns_decimal[origin:origin+horizon]
+        g_fcast = garch_vol_forecast(train*100, horizon_days=horizon)
+        h_fcast = historical_vol_forecast(train, window=hist_window)
+        actual = realized_vol(future, horizon)
+        garch_errors.append(g_fcast - actual)
+        hist_errors.append(h_fcast - actual)
+        origins.append(origin)
+    return np.array(garch_errors), np.array(hist_errors), origins
+
+
+# ============================================================
+# D. IMPLIED VOLATILITY SMILE + SIGNIFICANCE TEST
+#
+# NOTE ON DATA SOURCE: yfinance does not reliably provide NSE index/stock
+# option chains. Supply your own option chain as a CSV with columns:
+#   strike, market_price, option_type   (option_type = 'call' or 'put')
+# for a single underlying, single expiry, single snapshot in time.
+# Source options: a broker API you have access to (e.g. Zerodha Kite
+# Connect, Upstox), or NSE's own option-chain data if you can pull it.
+# ============================================================
+def build_smile(option_chain_csv, S, T, r, q=DIVIDEND_YIELD):
+    """
+    option_chain_csv: path to CSV with columns strike, market_price, option_type
+    S: underlying spot price at the time the chain was snapshotted
+    T: time to expiry in years (e.g. days_to_expiry / 365)
+    """
+    chain = pd.read_csv(option_chain_csv)
+    chain['iv'] = chain.apply(
+        lambda row: implied_volatility(row['market_price'], S, row['strike'], T, r, q, row['option_type']),
+        axis=1
+    )
+    chain = chain.dropna(subset=['iv'])
+    return chain
+
+
+def smile_regression(strikes, ivs, S):
+    """
+    Regress IV on moneyness (log(K/S), linear = skew) and moneyness^2
+    (quadratic = curvature).
+    H0 (skew):      beta1 = 0  (no linear tilt -- BS assumption holds)
+    H0 (curvature): beta2 = 0  (no convex smile shape)
+    """
+    moneyness = np.log(np.asarray(strikes) / S)
+    X = np.column_stack([np.ones_like(moneyness), moneyness, moneyness**2])
+    y = np.asarray(ivs)
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    n, k = X.shape
+    resid = y - X @ beta
+    dof = n - k
+    sigma2 = (resid @ resid) / dof
+    cov_beta = sigma2 * np.linalg.inv(X.T @ X)
+    se = np.sqrt(np.diag(cov_beta))
+    t_stats = beta / se
+    p_values = 2 * (1 - stats.t.cdf(np.abs(t_stats), dof))
+    ss_res = resid @ resid
+    ss_tot = ((y - y.mean())**2).sum()
+    r2 = 1 - ss_res/ss_tot
+    return {'intercept': beta[0], 'skew_coef': beta[1], 'curvature_coef': beta[2],
+            'skew_p': p_values[1], 'curvature_p': p_values[2], 'r2': r2}
+
+
+# ============================================================
+# E. PRICING ACCURACY: GARCH-VOL vs HISTORICAL-VOL AGAINST REAL MARKET PRICES
+# ============================================================
+def compare_pricing_accuracy(errors_garch, errors_hist):
+    """
+    Paired Wilcoxon signed-rank test on absolute pricing errors.
+    H0: median absolute pricing error is equal between the two vol inputs.
+    """
+    abs_g = np.abs(errors_garch)
+    abs_h = np.abs(errors_hist)
+    stat, p = stats.wilcoxon(abs_g, abs_h)
+    return {'median_abs_err_garch': np.median(abs_g), 'median_abs_err_hist': np.median(abs_h),
+            'wilcoxon_stat': stat, 'p_value': p}
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def run_volatility_forecast_section(prices):
+    returns = prices.pct_change().dropna().values
+    train_returns = returns[:int(len(returns)*0.7)]  # rough split; adjust to TRAIN/TEST dates if preferred
+
+    print("="*60)
+    print("SECTION 1: GARCH(1,1) vs HISTORICAL VOL -- WALK-FORWARD EVALUATION")
+    print("="*60)
+    print(f"Window={VOL_WINDOW}d, horizon={VOL_HORIZON}d, step={VOL_STEP}d "
+          f"(this can take a few minutes locally)")
+    g_err, h_err, origins = walk_forward_vol_eval(returns)
+    print(f"Forecast origins evaluated: {len(g_err)}")
+    print(f"Mean |GARCH error|:      {np.mean(np.abs(g_err)):.5f}")
+    print(f"Mean |Historical error|: {np.mean(np.abs(h_err)):.5f}")
+
+    dm = diebold_mariano_test(g_err, h_err, h=VOL_HORIZON)
+    print(f"\nDiebold-Mariano test (H0: equal forecast accuracy):")
+    print(f"  DM statistic: {dm['dm_stat']:.3f}")
+    print(f"  p-value:      {dm['p_value']:.4f}")
+    print(f"  Mean loss diff (GARCH - Hist, squared error): {dm['mean_loss_diff']:.6f}")
+    if dm['p_value'] < 0.05:
+        winner = "GARCH" if dm['mean_loss_diff'] < 0 else "Historical"
+        conclusion = f"Reject H0 at 5%: {winner} has significantly lower forecast error."
+    else:
+        conclusion = ("Fail to reject H0: no statistically significant difference in "
+                       "forecast accuracy between GARCH(1,1) and naive historical volatility.")
+    print(f"  -> {conclusion}")
+
+    # ---- persist results so they're visible without re-running ----
+    with open('garch_vs_historical_results.txt', 'w') as f:
+        f.write("GARCH(1,1) vs Historical Volatility -- Walk-Forward Evaluation\n")
+        f.write("="*65 + "\n")
+        f.write(f"Underlying: {UNDERLYING}\n")
+        f.write(f"Run date:   {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}\n")
+        f.write(f"Window={VOL_WINDOW}d, horizon={VOL_HORIZON}d, step={VOL_STEP}d\n")
+        f.write(f"Forecast origins evaluated: {len(g_err)}\n\n")
+        f.write(f"Mean |GARCH error|:      {np.mean(np.abs(g_err)):.5f}\n")
+        f.write(f"Mean |Historical error|: {np.mean(np.abs(h_err)):.5f}\n\n")
+        f.write("Diebold-Mariano test (H0: equal forecast accuracy):\n")
+        f.write(f"  DM statistic: {dm['dm_stat']:.3f}\n")
+        f.write(f"  p-value:      {dm['p_value']:.4f}\n")
+        f.write(f"  Mean loss diff (GARCH - Hist, squared error): {dm['mean_loss_diff']:.6f}\n")
+        f.write(f"  -> {conclusion}\n")
+    print("\nResults saved to garch_vs_historical_results.txt")
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(origins, np.abs(g_err), label='|GARCH forecast error|', marker='o', ms=3)
+    plt.plot(origins, np.abs(h_err), label='|Historical forecast error|', marker='o', ms=3)
+    plt.xlabel('Forecast origin (trading day index)')
+    plt.ylabel('Absolute volatility forecast error')
+    plt.title(f'{UNDERLYING}: GARCH(1,1) vs Historical Vol Forecast Error\n'
+              f'DM p-value = {dm["p_value"]:.3f}')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('garch_vs_historical.png', dpi=100)
+    print("Chart saved to garch_vs_historical.png")
+
+    return g_err, h_err, origins, returns
+
+
+def run_multi_stock_robustness(tickers=ROBUSTNESS_TICKERS, start=START, end=TEST_END):
+    """
+    Repeats the GARCH vs historical-vol walk-forward test across multiple
+    stocks to check whether the finding on the primary UNDERLYING (no
+    significant GARCH advantage) is consistent, or specific to one name.
+    """
+    print("\n" + "="*60)
+    print("MULTI-STOCK ROBUSTNESS CHECK")
+    print("="*60)
+    rows = []
+    for ticker in tickers:
+        print(f"\n--- {ticker} ---")
+        prices = load_price_history(ticker, start, end)
+        returns = prices.pct_change().dropna().values
+        g_err, h_err, origins = walk_forward_vol_eval(returns)
+        dm = diebold_mariano_test(g_err, h_err, h=VOL_HORIZON)
+        print(f"  n_origins={len(g_err)}  mean|GARCH err|={np.mean(np.abs(g_err)):.5f}  "
+              f"mean|Hist err|={np.mean(np.abs(h_err)):.5f}  "
+              f"DM={dm['dm_stat']:.3f}  p={dm['p_value']:.4f}")
+        rows.append({
+            'ticker': ticker, 'n_origins': len(g_err),
+            'mean_abs_garch_err': np.mean(np.abs(g_err)),
+            'mean_abs_hist_err': np.mean(np.abs(h_err)),
+            'dm_stat': dm['dm_stat'], 'p_value': dm['p_value'],
+            'significant_at_5pct': dm['p_value'] < 0.05
+        })
+
+    summary = pd.DataFrame(rows)
+    print("\nSUMMARY ACROSS STOCKS:")
+    print(summary.to_string(index=False))
+    n_sig = summary['significant_at_5pct'].sum()
+    print(f"\n{n_sig} of {len(summary)} stocks show a statistically significant "
+          f"GARCH vs historical-vol difference at the 5% level.")
+
+    summary.to_csv('garch_robustness_summary.csv', index=False)
+    print("Summary saved to garch_robustness_summary.csv")
+
+    plt.figure(figsize=(8, 5))
+    colors = ['crimson' if sig else 'steelblue' for sig in summary['significant_at_5pct']]
+    plt.bar(summary['ticker'], summary['p_value'], color=colors)
+    plt.axhline(0.05, color='gray', linestyle='--', label='p = 0.05 threshold')
+    plt.ylabel('Diebold-Mariano p-value')
+    plt.title('GARCH vs Historical Vol: Significance Across Stocks')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('garch_robustness.png', dpi=100)
+    print("Chart saved to garch_robustness.png")
+
+    return summary
+
+
+def run_smile_section(option_chain_csv, S, T, r):
+    print("\n" + "="*60)
+    print("SECTION 2: IMPLIED VOLATILITY SMILE + SIGNIFICANCE TEST")
+    print("="*60)
+    chain = build_smile(option_chain_csv, S, T, r)
+    print(chain[['strike', 'option_type', 'market_price', 'iv']])
+
+    reg = smile_regression(chain['strike'].values, chain['iv'].values, S)
+    print(f"\nRegression: IV ~ intercept + skew*moneyness + curvature*moneyness^2")
+    print(f"  Intercept (ATM-ish IV level): {reg['intercept']:.4f}")
+    print(f"  Skew coefficient:    {reg['skew_coef']:.4f}  (p={reg['skew_p']:.4f})")
+    print(f"  Curvature coefficient: {reg['curvature_coef']:.4f}  (p={reg['curvature_p']:.4f})")
+    print(f"  R^2: {reg['r2']:.4f}")
+    if reg['skew_p'] < 0.05 or reg['curvature_p'] < 0.05:
+        print("  -> Reject H0: implied volatility varies significantly across strikes.")
+        print("     This empirically confirms Black-Scholes' constant-volatility")
+        print("     assumption does not hold for this option chain.")
+    else:
+        print("  -> Fail to reject H0: no statistically significant smile/skew detected")
+        print("     in this chain (may reflect low liquidity / wide bid-ask, or a")
+        print("     genuinely flat vol surface for this underlying/expiry).")
+
+    plt.figure(figsize=(8,5))
+    plt.scatter(chain['strike'], chain['iv'], label='Market-implied IV')
+    plt.xlabel('Strike'); plt.ylabel('Implied Volatility'); plt.title('Volatility Smile/Skew')
+    plt.axvline(S, color='gray', linestyle='--', label='Spot')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('vol_smile.png', dpi=100)
+    print("\nSmile chart saved to vol_smile.png")
+    return chain, reg
+
+
+if __name__ == "__main__":
+    prices = load_price_history()
+    print(f"Loaded {len(prices)} days of {UNDERLYING} price history.")
+
+    # Section 1: GARCH vs historical volatility forecasting (primary underlying)
+    run_volatility_forecast_section(prices)
+
+    # Section 1b: robustness check across multiple stocks
+    run_multi_stock_robustness()
+
+    # Section 2: implied vol smile -- uncomment and point to your CSV once
+    # you have a real option chain snapshot
+    # S_spot = prices.iloc[-1]
+    # T_expiry = 30/365  # e.g. 30 days to expiry
+    # run_smile_section("option_chain.csv", S_spot, T_expiry, RISK_FREE)
+
+    print("\nDone. Section 2 (smile) needs a real option chain CSV -- see the NOTE "
+          "above build_smile() for data source options.")
