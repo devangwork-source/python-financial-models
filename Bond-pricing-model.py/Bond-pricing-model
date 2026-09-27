@@ -1,77 +1,324 @@
-# Bond pricing model
+"""
+Project 4: Fixed-Income -- Interest Rate Risk & Yield Curve Modeling
+======================================================================
+
+Builds on the original bond_price / modified_duration / convexity / DV01 script
+(which was already mathematically correct -- see the fixed robustness note below)
+and adds the two things a plain bond-pricer doesn't give you:
+
+1. THEORETICAL vs EMPIRICAL DURATION, as a real hypothesis test:
+   - Theoretical: closed-form Macaulay duration (and modified duration derived
+     from it), computed once at a single reference yield -- a LOCAL, linear
+     approximation of price sensitivity.
+   - Empirical: our bond is exactly repriced (full valuation, not an approximation)
+     at every point in a REAL historical yield series, then we regress the
+     resulting %ΔPrice on Δyield to estimate the AVERAGE realised sensitivity
+     across whatever yield levels actually occurred.
+   Because duration itself is yield-level-dependent (that's what convexity is),
+   these two numbers can legitimately differ -- and by how much is the finding.
+
+2. YIELD CURVE SCENARIOS instead of one flat "rates go up 1%" toy example:
+   parallel shift, steepening, and flattening, each re-priced by full
+   revaluation off an interpolated curve, and compared against what the
+   duration+convexity Taylor approximation would have predicted.
+
+Requirements: numpy, pandas, matplotlib, yfinance
+    pip install numpy pandas matplotlib yfinance --break-system-packages   (Linux/Mac)
+    py -m pip install numpy pandas matplotlib yfinance                    (Windows)
+"""
 
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+import warnings
+warnings.filterwarnings("ignore")
 
-# Bond Price
+# ============================================================================
+# CONFIG
+# ============================================================================
+FACE = 1000
+COUPON_RATE = 0.08
+YIELD_RATE = 0.07     # reference/current yield for the "theoretical" duration point estimate
+MATURITY = 5           # years
+FREQ = 1               # coupon frequency per year
 
+# Real yield series used for the empirical-duration test.
+# NOTE: this bond is a generic, currency-unspecified instrument (same as the
+# original script) -- there's no traded price history of its own to pull.
+# ^TNX (CBOE 10-Year Treasury Note Yield Index, US) is used as a real, freely
+# available reference yield series to drive the empirical repricing exercise.
+# This is a proxy, not this bond's own market -- flagged in the README, same
+# spirit as the multiple-testing caveat in Project 3.
+YIELD_TICKER = "^TNX"   # yfinance quotes this as yield*10, e.g. 42.50 -> 4.25%
+TRAIN_START, TRAIN_END = "2020-01-01", "2023-12-31"
+TEST_START, TEST_END = "2024-01-01", "2025-04-01"
+
+# Yield curve scenario config (tenor points in years -> yield)
+BASE_CURVE = {1: 0.065, 2: 0.067, 5: 0.070, 10: 0.072, 30: 0.075}
+PARALLEL_SHIFT_BPS = 100
+STEEPEN_SHORT_BPS, STEEPEN_LONG_BPS = -50, 50
+FLATTEN_SHORT_BPS, FLATTEN_LONG_BPS = 50, -50
+CURVE_SHORT_ANCHOR, CURVE_LONG_ANCHOR = 1, 30
+
+
+# ============================================================================
+# PART A: bond pricing + theoretical (closed-form) duration/convexity
+# ============================================================================
 def bond_price(face, coupon_rate, yield_rate, maturity, freq=1):
-    
+    periods = int(round(maturity * freq))   # robustness fix: `maturity * freq` used to go
+    coupon = face * coupon_rate / freq      # straight into range(), which throws a TypeError
+    y = yield_rate / freq                   # the moment maturity is a float (e.g. 4.5 years)
+    t = np.arange(1, periods + 1)
+    cashflows = np.full(periods, coupon, dtype=float)
+    cashflows[-1] += face
+    return float(np.sum(cashflows / (1 + y) ** t))
+
+
+def macaulay_duration(face, coupon_rate, yield_rate, maturity, freq=1):
+    """Closed-form: time-weighted (in YEARS) average of the PV of each cashflow, over price.
+    This was MISSING from the original script -- only a numerical/bumped duration existed."""
+    periods = int(round(maturity * freq))
     coupon = face * coupon_rate / freq
-    periods = maturity * freq
     y = yield_rate / freq
-    
-    price = 0
-    
-    for t in range(1, periods + 1):
-        price += coupon / (1 + y)**t
-        
-    price += face / (1 + y)**periods
-    
-    return price
+    t = np.arange(1, periods + 1)
+    cashflows = np.full(periods, coupon, dtype=float)
+    cashflows[-1] += face
+    pv_cf = cashflows / (1 + y) ** t
+    price = pv_cf.sum()
+    weighted_time_years = np.sum((t / freq) * pv_cf)
+    return weighted_time_years / price
 
 
+def modified_duration_theoretical(face, coupon_rate, yield_rate, maturity, freq=1):
+    mac_dur = macaulay_duration(face, coupon_rate, yield_rate, maturity, freq)
+    return mac_dur / (1 + yield_rate / freq)
 
-# Modified Duration (Numerical)
 
-def modified_duration(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
-    
+def effective_duration(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
+    """Numerical/bumped duration from the original script, kept as an internal
+    cross-check against the closed-form theoretical duration above."""
     price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
-    
     price_up = bond_price(face, coupon_rate, yield_rate + bump, maturity, freq)
     price_down = bond_price(face, coupon_rate, yield_rate - bump, maturity, freq)
-    
-    mod_duration = (price_down - price_up) / (2 * price * bump)
-    
-    return mod_duration
+    return (price_down - price_up) / (2 * price * bump)
 
 
+def convexity(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
+    price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
+    price_up = bond_price(face, coupon_rate, yield_rate + bump, maturity, freq)
+    price_down = bond_price(face, coupon_rate, yield_rate - bump, maturity, freq)
+    return (price_up + price_down - 2 * price) / (price * bump ** 2)
 
-# DV01
 
 def dv01(face, coupon_rate, yield_rate, maturity, freq=1):
-    
-    mod_dur = modified_duration(face, coupon_rate, yield_rate, maturity, freq)
+    mod_dur = effective_duration(face, coupon_rate, yield_rate, maturity, freq)
     price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
-    
     return mod_dur * price * 0.0001
 
 
-
-# Convexity (Numerical)
-
-def convexity(face, coupon_rate, yield_rate, maturity, freq=1, bump=0.0001):
-    
-    price = bond_price(face, coupon_rate, yield_rate, maturity, freq)
-    
-    price_up = bond_price(face, coupon_rate, yield_rate + bump, maturity, freq)
-    price_down = bond_price(face, coupon_rate, yield_rate - bump, maturity, freq)
-    
-    convex = (price_up + price_down - 2 * price) / (price * bump**2)
-    
-    return convex
+# ============================================================================
+# PART B: empirical duration from a real historical yield series
+# ============================================================================
+def download_yield_series(ticker, start, end):
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    return (close / 10.0).dropna()   # ^TNX quotes as yield*10
 
 
-face = 1000
-coupon = 0.08
-yield_rate = 0.07
-maturity = 5
-
-print("Price:", bond_price(face, coupon, yield_rate, maturity))
-print("Modified Duration:", modified_duration(face, coupon, yield_rate, maturity))
-print("Convexity:", convexity(face, coupon, yield_rate, maturity))
-print("DV01:", dv01(face, coupon, yield_rate, maturity))
+def build_shadow_price_series(yield_series, face, coupon_rate, maturity, freq=1):
+    """EXACT full revaluation of OUR bond at each historically observed yield level."""
+    return yield_series.apply(lambda y: bond_price(face, coupon_rate, y, maturity, freq))
 
 
+def empirical_duration(price_series, yield_series):
+    """OLS: %ΔP_t = -D_empirical * Δy_t + eps_t"""
+    pct_price_change = price_series.pct_change().dropna()
+    yield_change = yield_series.diff().dropna()
+    common = pct_price_change.index.intersection(yield_change.index)
+    x = yield_change.loc[common].values
+    y_ = pct_price_change.loc[common].values
+    X = np.vstack([np.ones(len(x)), x]).T
+    coef, *_ = np.linalg.lstsq(X, y_, rcond=None)
+    empirical_dur = -coef[1]
+    fitted = X @ coef
+    ss_res = np.sum((y_ - fitted) ** 2)
+    ss_tot = np.sum((y_ - y_.mean()) ** 2)
+    r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return empirical_dur, r_squared
 
 
+# ============================================================================
+# PART C: yield curve scenarios
+# ============================================================================
+def interpolate_curve(curve, tenor):
+    tenors = np.array(sorted(curve.keys()))
+    yields = np.array([curve[t] for t in tenors])
+    return float(np.interp(tenor, tenors, yields))
 
+
+def shift_curve(curve, short_bps, long_bps, short_tenor=CURVE_SHORT_ANCHOR, long_tenor=CURVE_LONG_ANCHOR):
+    shifted = {}
+    for t, y in curve.items():
+        frac = float(np.clip((t - short_tenor) / (long_tenor - short_tenor), 0, 1))
+        shift_bps = short_bps + frac * (long_bps - short_bps)
+        shifted[t] = y + shift_bps / 10000.0
+    return shifted
+
+
+def price_bond_on_curve(curve, face, coupon_rate, maturity, freq=1):
+    """Discounts each cashflow at the curve-interpolated yield for ITS OWN tenor."""
+    periods = int(round(maturity * freq))
+    coupon = face * coupon_rate / freq
+    price = 0.0
+    for p in range(1, periods + 1):
+        t_years = p / freq
+        y = interpolate_curve(curve, t_years)
+        cf = coupon + (face if p == periods else 0.0)
+        price += cf / (1 + y / freq) ** p
+    return price
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
+    print("=" * 78)
+    print("STEP 1: Base bond pricing + theoretical duration/convexity")
+    print("=" * 78)
+    price = bond_price(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    mac_dur = macaulay_duration(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    mod_dur_theory = modified_duration_theoretical(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    mod_dur_numeric = effective_duration(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    conv = convexity(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    d01 = dv01(FACE, COUPON_RATE, YIELD_RATE, MATURITY, FREQ)
+    print(f"Price:                            {price:.2f}")
+    print(f"Macaulay duration:                {mac_dur:.4f} years")
+    print(f"Modified duration (closed-form):  {mod_dur_theory:.4f}")
+    print(f"Modified duration (numeric bump): {mod_dur_numeric:.4f}   <- should closely match the line above")
+    print(f"Convexity:                        {conv:.4f}")
+    print(f"DV01:                             {d01:.4f}")
+
+    print("\n" + "=" * 78)
+    print(f"STEP 2: Empirical duration from real {YIELD_TICKER} history (proxy yield series)")
+    print("=" * 78)
+    yield_series = download_yield_series(YIELD_TICKER, TRAIN_START, TEST_END)
+    shadow_prices = build_shadow_price_series(yield_series, FACE, COUPON_RATE, MATURITY, FREQ)
+
+    train_yields = yield_series.loc[TRAIN_START:TRAIN_END]
+    train_prices = shadow_prices.loc[TRAIN_START:TRAIN_END]
+    test_yields = yield_series.loc[TEST_START:TEST_END]
+    test_prices = shadow_prices.loc[TEST_START:TEST_END]
+
+    emp_dur_train, r2_train = empirical_duration(train_prices, train_yields)
+    emp_dur_test, r2_test = empirical_duration(test_prices, test_yields)
+
+    print(f"Yield range observed, train ({TRAIN_START} to {TRAIN_END}): "
+          f"{train_yields.min()*100:.2f}% to {train_yields.max()*100:.2f}%")
+    print(f"Yield range observed, test  ({TEST_START} to {TEST_END}): "
+          f"{test_yields.min()*100:.2f}% to {test_yields.max()*100:.2f}%")
+    print(f"Empirical duration, TRAIN: {emp_dur_train:.4f}  (R^2={r2_train:.4f})")
+    print(f"Empirical duration, TEST:  {emp_dur_test:.4f}  (R^2={r2_test:.4f})")
+    print(f"Theoretical modified duration @ y={YIELD_RATE*100:.1f}%: {mod_dur_theory:.4f}")
+    print(f"Gap (train empirical - theoretical): {emp_dur_train - mod_dur_theory:+.4f}")
+    print(f"Gap (test empirical - theoretical):  {emp_dur_test - mod_dur_theory:+.4f}")
+    print("Interpretation: theoretical duration is a LOCAL approximation at one yield level; "
+          "the empirical figure is the AVERAGE sensitivity actually realised across whatever "
+          "yield levels occurred in that window. A meaningful gap here is expected when the "
+          "period saw yields move far from the reference level, and is the real finding for "
+          "this project -- not a bug in either calculation.")
+
+    print("\n" + "=" * 78)
+    print("STEP 3: Yield curve scenarios (parallel / steepening / flattening)")
+    print("=" * 78)
+    base_price = price_bond_on_curve(BASE_CURVE, FACE, COUPON_RATE, MATURITY, FREQ)
+    parallel_curve = shift_curve(BASE_CURVE, PARALLEL_SHIFT_BPS, PARALLEL_SHIFT_BPS)
+    steepen_curve = shift_curve(BASE_CURVE, STEEPEN_SHORT_BPS, STEEPEN_LONG_BPS)
+    flatten_curve = shift_curve(BASE_CURVE, FLATTEN_SHORT_BPS, FLATTEN_LONG_BPS)
+
+    scenarios = {
+        "Parallel +100bps": parallel_curve,
+        "Steepening": steepen_curve,
+        "Flattening": flatten_curve,
+    }
+
+    print(f"Base curve price: {base_price:.2f}")
+    scenario_results = {}
+    for name, curve in scenarios.items():
+        p = price_bond_on_curve(curve, FACE, COUPON_RATE, MATURITY, FREQ)
+        pct_change = (p / base_price - 1) * 100
+        dy = interpolate_curve(curve, MATURITY) - interpolate_curve(BASE_CURVE, MATURITY)
+        taylor_pct = (-mod_dur_theory * dy + 0.5 * conv * dy ** 2) * 100
+        scenario_results[name] = {"price": p, "actual_pct": pct_change, "dy_bps": dy * 10000,
+                                   "taylor_pct": taylor_pct}
+        print(f"  {name:20s}: price={p:9.2f}  actual={pct_change:+.3f}%  "
+              f"duration+convexity approx={taylor_pct:+.3f}%  (5Y point moved {dy*10000:+.1f}bps)")
+
+    print("\n" + "=" * 78)
+    print("STEP 4: Plot")
+    print("=" * 78)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    ax = axes[0, 0]
+    ax.plot(yield_series.index, yield_series * 100)
+    ax.axvline(pd.Timestamp(TRAIN_END), color="gray", linestyle="--", linewidth=1)
+    ax.set_title(f"{YIELD_TICKER} yield history (proxy)")
+    ax.set_ylabel("Yield (%)")
+
+    ax = axes[0, 1]
+    ax.scatter(yield_series.diff() * 10000, shadow_prices.pct_change() * 100, s=4, alpha=0.4)
+    ax.set_xlabel("Daily yield change (bps)")
+    ax.set_ylabel("Daily bond price change (%)")
+    ax.set_title(f"Empirical duration fit (slope -> duration)\nTrain D={emp_dur_train:.2f}  Test D={emp_dur_test:.2f}")
+
+    ax = axes[1, 0]
+    for name, curve in [("Base", BASE_CURVE)] + list(scenarios.items()):
+        tenors = sorted(curve.keys())
+        ax.plot(tenors, [curve[t] * 100 for t in tenors], marker="o", label=name)
+    ax.set_xlabel("Tenor (years)")
+    ax.set_ylabel("Yield (%)")
+    ax.set_title("Yield curve scenarios")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    names = list(scenario_results.keys())
+    actual = [scenario_results[n]["actual_pct"] for n in names]
+    approx = [scenario_results[n]["taylor_pct"] for n in names]
+    x = np.arange(len(names))
+    ax.bar(x - 0.2, actual, width=0.4, label="Actual (full reval)")
+    ax.bar(x + 0.2, approx, width=0.4, label="Duration+convexity approx")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, fontsize=8)
+    ax.set_ylabel("% price change")
+    ax.set_title("Scenario stress test: actual vs approximation")
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("output.png", dpi=150)
+    print("Saved chart to output.png")
+
+
+if __name__ == "__main__":
+    main()
+
+# ============================================================================
+# HONEST LIMITATIONS (for README / interview talking points, not hidden)
+# ============================================================================
+# 1. Proxy yield series: the bond itself is a generic, currency-unspecified
+#    instrument with no market of its own, so ^TNX (US 10Y Treasury yield) is
+#    used as a real reference series for the empirical-duration test. A bond
+#    actually issued in a specific market should use that market's own yield
+#    history instead.
+# 2. Curve interpolation is linear by raw tenor NUMBER (not log-tenor or a
+#    spline) across only 5 points -- a real curve build uses more tenor points
+#    and a smoother interpolation method. This also means a mid-curve point
+#    like 5Y sits numerically closer to the short anchor (1Y) than the long
+#    anchor (30Y) in a 1-30Y range, which shapes how steepening/flattening
+#    scenarios affect it -- noted so it isn't mistaken for a bug.
+# 3. Single bond, single reference yield level for the "theoretical" duration
+#    point estimate -- like Projects 1 and 3, this is one instrument and one
+#    historical window, not a study across many bonds/curves/periods.
+# 4. No credit spread, liquidity, or optionality modeled -- this is a plain
+#    vanilla, option-free bond.
